@@ -239,6 +239,9 @@ class RustBPETokenizer:
         else:
             raise ValueError(f"Invalid input type: {type(text)}")
 
+        # 显示encode结果
+        print(f"{text} encode into: {ids}")
+
         return ids
 
     def __call__(self, *args, **kwargs):

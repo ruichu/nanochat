@@ -253,8 +253,15 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
+
+        # 显示idx
+        #print(f"idx: {idx}")
         x = self.transformer.wte(idx)
         x = norm(x)
+
+        # 显示x的维度和前10个元素
+        #print(f"x shape: {x.shape}, first 10 elements: {x.flatten()[:10]}")
+
         for block in self.transformer.h:
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
