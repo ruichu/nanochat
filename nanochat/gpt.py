@@ -37,41 +37,53 @@ def norm(x):
     # Purely functional rmsnorm with no learnable params
     return F.rms_norm(x, (x.size(-1),))
 
-
+# RoPE (旋转位置编码) 算法的实现
 def apply_rotary_emb(x, cos, sin):
+    # 这里的cos和sin实际上是 _precompute_rotary_embeddings 函数预计算得到的旋转嵌入
     assert x.ndim == 4  # multihead attention
+    # 将输入张量x的最后一个维度一分为二，分别对应cos和sin
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
+    # 应用旋转变换
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     out = torch.cat([y1, y2], 3) # re-assemble
     out = out.to(x.dtype) # ensure input/output dtypes match
     return out
 
+# 因果自注意力，Transformer的组成部分之一（另一个是MLP）
+# 因果自注意力是指：仅允许注意力模型访问当前和之前的输入,而不能访问之后的输入
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
+        # 区分n_head和n_kv_head是为了实现Grouped-Query Attention (GQA)，这是一种优化推理内存的技术
+        # GQA通过让多个查询头共享同一个键值头来减少KV cache的内存占用（默认未启用，即n_head == n_kv_head）
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        # c_q, c_k, c_v是Transformer架构中的Wq, Wk, Wv权重矩阵的实现
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        # c_proj将多头注意力输出投影回原始维度
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
     def forward(self, x, cos_sin, kv_cache):
+        # B, T, C分别是batch_size, sequence_length, embedding_size
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
+        # 先计算Q，K，V，然后用view方法在不复制数据的情况下重新组织张量的维度
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        # RoPE规定：在Q和K上应用旋转嵌入，来实现相对位置编码
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
         q, k = norm(q), norm(k) # QK norm
@@ -79,21 +91,27 @@ class CausalSelfAttention(nn.Module):
 
         # Apply KV cache: insert current k,v into cache, get the full view so far
         if kv_cache is not None:
+            # 将当前层的键值对插入缓存，并返回完整的缓存视图供注意力计算使用
             k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-        Tq = q.size(2) # number of queries in this forward pass
+        # q,k的形状为 [B, n_head, T, head_dim]，所以下一步是获取T
+        # 在推理过程中，由于 KV cache 的存在，Tq == T，但Tk != T
+        Tq = q.size(2) # number of queries in this forward pass  # 这一步实际上是冗余的，因为Tq == T，这里只是为了方便理解
         Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
 
         # Attention: queries attend to keys/values autoregressively. A few cases to handle:
         enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
         if kv_cache is None or Tq == Tk:
+            # 训练阶段
             # During training (no KV cache), attend as usual with causal attention
             # And even if there is KV cache, we can still use this simple version when Tq == Tk
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
         elif Tq == 1:
+            # 推理阶段，但只输入单个token（标准的自回归生成。前面的tokens通过KV cache，在prefill阶段被保存和复用）
             # During inference but with a single query in this forward pass:
             # The query has to attend to all the keys/values in the cache
             y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
         else:
+            # 推理阶段，输入一个chunk的token（批量生成）
             # During inference AND we have a chunk of queries in this forward pass:
             # First, each query attends to all the cached keys/values (i.e. full prefix)
             attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device) # True = keep, False = mask
@@ -109,7 +127,7 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
-
+# 多层全连接网络，Transformer的组成部分之一（另一个是因果自注意力）
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -117,12 +135,13 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
+        # 先升维，再relu平方（简单且计算效率高），再降维
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
-
+# 一个Transformer的block，包含一个因果自注意力和一个MLP
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -130,6 +149,7 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
+        # 依次执行因果自注意力和MLP，注意这里使用了残差连接
         x = x + self.attn(norm(x), cos_sin, kv_cache)
         x = x + self.mlp(norm(x))
         return x
@@ -139,10 +159,13 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        # wte：word token embedding
+        # h：hidden layers，也就是transformer blocks
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
+        # lm_head：language model head，用一个线性层把transformer的输出映射到词汇表大小的logits
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
@@ -150,7 +173,8 @@ class GPT(nn.Module):
         # In the future we can dynamically grow the cache, for now it's fine.
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)  # 预计算旋转嵌入，这里是为了支持meta device初始化。真正的计算在init_weights中
+        # 将cos和sin注册为模型参数，这些参数不会被训练
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
@@ -170,6 +194,7 @@ class GPT(nn.Module):
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
+    # 通过 self.apply() 间接应用到所有模块
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             # https://arxiv.org/pdf/2310.17813
@@ -182,6 +207,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
 
+    # 预计算旋转嵌入的sin和cos值
     # TODO: bump base theta more, e.g. 100K is more common more recently
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # autodetect the device from model embeddings
@@ -193,7 +219,7 @@ class GPT(nn.Module):
         # stride the time steps
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         # calculate the rotation frequencies at each (time, channel) pair
-        freqs = torch.outer(t, inv_freq)
+        freqs = torch.outer(t, inv_freq)    # 计算两个一维张量的外积，得到一个二维张量（shape: [seq_len, head_dim/2]）
         cos, sin = freqs.cos(), freqs.sin()
         cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
@@ -210,8 +236,11 @@ class GPT(nn.Module):
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
+    # 不同的参数组使用不同的优化器和学习率
+    # 双优化器系统是现代LLM训练的先进技术，提供了更好的训练稳定性和收敛性能
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
+        # 获取分布式训练相关信息，其中ddp代表是否启用分布式训练
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = list(self.transformer.h.parameters())
@@ -241,8 +270,9 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
+    # 自回归的过程，每次生成一个token
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        B, T = idx.size()
+        B, T = idx.size()       # idx是输入的token IDs
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -256,12 +286,15 @@ class GPT(nn.Module):
 
         # 显示idx
         #print(f"idx: {idx}")
+
+        # 把idx向量转换为embedding向量
         x = self.transformer.wte(idx)
-        x = norm(x)
+        x = norm(x) # 归一化
 
         # 显示x的维度和前10个元素
         #print(f"x shape: {x.shape}, first 10 elements: {x.flatten()[:10]}")
 
+        # 依次经过每个Transformer block，最后再归一化
         for block in self.transformer.h:
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
@@ -278,10 +311,13 @@ class GPT(nn.Module):
             return loss
         else:
             # inference mode: compute and return the logits
-            logits = self.lm_head(x)
+            logits = self.lm_head(x)       # 映射到词汇表大小的logits，形状[B, T, vocab_size]
+            # logits是"log-odds"的缩写，表示对数几率，即log(p(y|x))
+            # 将logits值压缩到[-15, 15]范围内，防止过大或过小导致计算不稳定
             logits = softcap * torch.tanh(logits / softcap) # logits softcap
             return logits
 
+    # 朴素的自回归推理，无KV cache优化，用于测试和对比实验
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
         """
@@ -299,7 +335,7 @@ class GPT(nn.Module):
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
         for _ in range(max_tokens):
             logits = self.forward(ids) # (B, T, vocab_size)
-            logits = logits[:, -1, :] # (B, vocab_size)
+            logits = logits[:, -1, :] # (B, vocab_size)     # 取出最后一个token的logits
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
